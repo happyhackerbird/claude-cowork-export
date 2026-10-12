@@ -32,7 +32,7 @@ python3 cowork_export.py --unassigned                           # sessions in no
 python3 cowork_export.py --all
 ```
 
-On Windows use `py cowork_export.py ...`. The Cowork data folder is detected automatically on macOS (`~/Library/Application Support/Claude`), Windows (`%APPDATA%\Claude`) and Linux; override with `--base PATH`.
+On Windows use `py cowork_export.py ...`. The Cowork data folder is detected automatically on macOS (`~/Library/Application Support/Claude`), Windows and Linux. On Windows it checks `%APPDATA%\Claude`, then the Store/MSIX package folder (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`), then searches AppData. Override with `--base PATH`.
 
 ### Options
 

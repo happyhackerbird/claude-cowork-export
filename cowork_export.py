@@ -52,12 +52,60 @@ SKIP_RECORD_TYPES = {"queue-operation", "summary", "progress", "file-history-sna
 
 # ---------------------------------------------------------------- discovery
 
-def default_base() -> Path:
+SESSIONS_DIR = "local-agent-mode-sessions"
+
+
+def base_candidates() -> list[Path]:
+    """Every place Claude Desktop is known to keep its app data, most likely first."""
+    home = Path.home()
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Claude"
+        return [home / "Library" / "Application Support" / "Claude"]
     if os.name == "nt":
-        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "Claude"
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "Claude"
+        appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+        cands = [appdata / "Claude"]
+        # MSIX/Store installs: Windows redirects the app's %APPDATA% into its package folder.
+        pkgs = local / "Packages"
+        if pkgs.is_dir():
+            for pkg in sorted(pkgs.iterdir()):
+                if "claude" in pkg.name.lower() or "anthropic" in pkg.name.lower():
+                    cands += [pkg / "LocalCache" / "Roaming" / "Claude",
+                              pkg / "LocalCache" / "Local" / "Claude"]
+        cands += [local / "Claude", local / "AnthropicClaude"]
+        return cands
+    return [Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "Claude"]
+
+
+def search_for_base(roots: list[Path], max_depth: int = 6) -> Path | None:
+    """Last resort: walk the app-data roots looking for the Cowork sessions folder."""
+    for root in roots:
+        if not root.is_dir():
+            continue
+        start = len(root.parts)
+        for dirpath, dirnames, _ in os.walk(root):
+            if SESSIONS_DIR in dirnames:
+                return Path(dirpath)
+            if len(Path(dirpath).parts) - start >= max_depth:
+                dirnames[:] = []
+            else:  # skip big caches that never hold sessions
+                dirnames[:] = [d for d in dirnames if d.lower() not in
+                               ("cache", "code cache", "gpucache", "node_modules", "temp", "crashpad")]
+    return None
+
+
+def find_base() -> tuple[Path | None, list[Path]]:
+    cands = base_candidates()
+    for c in cands:
+        if (c / SESSIONS_DIR).is_dir():
+            return c, cands
+    if os.name == "nt":
+        home = Path.home()
+        roots = [Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming"),
+                 Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")]
+        found = search_for_base(roots)
+        if found:
+            return found, cands
+    return None, cands
 
 
 def lp(p) -> str:
@@ -79,9 +127,9 @@ def load_json(p: Path, default=None):
 
 def discover(base: Path):
     """Return (spaces, sessions). spaces: {space_id: {...}}; sessions: list of dicts."""
-    root = base / "local-agent-mode-sessions"
+    root = base / SESSIONS_DIR
     if not root.is_dir():
-        sys.exit(f"Not found: {root}\nPass --base to point at your Claude app-data folder.")
+        sys.exit(f"Not found: {root}\nPass --base to point at the folder that contains '{SESSIONS_DIR}'.")
     spaces: dict[str, dict] = {}
     sessions: list[dict] = []
     for account_dir in root.glob("*/*"):
@@ -445,7 +493,8 @@ def main():
         except Exception:
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base", type=Path, default=default_base(), help="Claude app-data folder (auto-detected)")
+    ap.add_argument("--base", type=Path, default=None,
+                    help=f"folder that contains '{SESSIONS_DIR}' (auto-detected)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--list", action="store_true", help="list spaces/projects and sessions")
     g.add_argument("--space", help="space name, space id, or project uuid")
@@ -467,6 +516,18 @@ def main():
         a.no_scrub = a.include_mounted = True
         a.no_thinking = False
         a.max_tool_chars = 0
+
+    if a.base is None:
+        a.base, tried = find_base()
+        if a.base is None:
+            msg = [f"Could not find Claude Cowork data ('{SESSIONS_DIR}' folder). Looked in:"]
+            msg += [f"  {c}" for c in tried]
+            if os.name == "nt":
+                msg += ["", "Find it with this PowerShell command, then rerun with --base \"<that folder>\":",
+                        "  Get-ChildItem $env:APPDATA,$env:LOCALAPPDATA -Directory -Recurse -Depth 7 "
+                        f"-Filter {SESSIONS_DIR} -ErrorAction SilentlyContinue | % Parent | % FullName"]
+            msg += ["", "If Cowork was never used on this machine, there is nothing to export."]
+            sys.exit("\n".join(msg))
 
     spaces, sessions = discover(a.base)
 
