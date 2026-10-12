@@ -30,6 +30,7 @@ python3 cowork_export.py --list                                 # show projects 
 python3 cowork_export.py --space "My Project" --include-mounted # export one project
 python3 cowork_export.py --unassigned                           # sessions in no project
 python3 cowork_export.py --all
+python3 cowork_export.py --diagnose                             # where it looked, newest sessions found
 ```
 
 On Windows use `py cowork_export.py ...`. The Cowork data folder is detected automatically on macOS (`~/Library/Application Support/Claude`), Windows and Linux. On Windows it checks `%APPDATA%\Claude`, then the Store/MSIX package folder (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`), then searches AppData. Override with `--base PATH`.

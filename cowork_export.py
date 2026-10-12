@@ -93,19 +93,34 @@ def search_for_base(roots: list[Path], max_depth: int = 6) -> Path | None:
     return None
 
 
-def find_base() -> tuple[Path | None, list[Path]]:
+def find_bases() -> tuple[list[Path], list[Path]]:
+    """All app-data folders that contain Cowork sessions (there can be more than one)."""
     cands = base_candidates()
+    found: list[Path] = []
     for c in cands:
-        if (c / SESSIONS_DIR).is_dir():
-            return c, cands
-    if os.name == "nt":
+        if (c / SESSIONS_DIR).is_dir() and c.resolve() not in [f.resolve() for f in found]:
+            found.append(c)
+    if not found and os.name == "nt":
         home = Path.home()
         roots = [Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming"),
                  Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")]
-        found = search_for_base(roots)
-        if found:
-            return found, cands
-    return None, cands
+        hit = search_for_base(roots)
+        if hit:
+            found.append(hit)
+    return found, cands
+
+
+def session_meta_files(root: Path):
+    """Yield every local_<id>.json session file under root, at any depth.
+
+    Does not descend into skills-plugin or into the session folders themselves,
+    which hold transcripts and outputs, not more sessions."""
+    for dirpath, dirnames, filenames in os.walk(lp(root)):
+        dirnames[:] = [d for d in dirnames if d != "skills-plugin" and not d.startswith(("local_", "."))
+                       and d not in JUNK_DIRS]
+        for fn in filenames:
+            if fn.startswith("local_") and fn.endswith(".json"):
+                yield Path(dirpath) / fn
 
 
 def lp(p) -> str:
@@ -125,33 +140,67 @@ def load_json(p: Path, default=None):
         return default
 
 
-def discover(base: Path):
-    """Return (spaces, sessions). spaces: {space_id: {...}}; sessions: list of dicts."""
-    root = base / SESSIONS_DIR
-    if not root.is_dir():
-        sys.exit(f"Not found: {root}\nPass --base to point at the folder that contains '{SESSIONS_DIR}'.")
+def discover(bases: list[Path]):
+    """Return (spaces, sessions) merged across all bases."""
     spaces: dict[str, dict] = {}
     sessions: list[dict] = []
-    for account_dir in root.glob("*/*"):
-        if not account_dir.is_dir() or "skills-plugin" in account_dir.parts:
-            continue
-        sp = load_json(account_dir / "spaces.json", {}) or {}
-        for s in sp.get("spaces", []):
-            s = dict(s)
-            s["_account_dir"] = str(account_dir)
-            spaces[s["id"]] = s
-        for meta_path in sorted(account_dir.glob("local_*.json")):
-            meta = load_json(meta_path)
-            if not isinstance(meta, dict) or "sessionId" not in meta:
+    seen_ids: set[str] = set()
+    for base in bases:
+        root = base / SESSIONS_DIR
+        if not root.is_dir():
+            sys.exit(f"Not found: {root}\nPass --base to point at the folder that contains '{SESSIONS_DIR}'.")
+        for sp_path in root.rglob("spaces.json"):
+            if "skills-plugin" in sp_path.parts:
                 continue
+            for s in (load_json(sp_path, {}) or {}).get("spaces", []):
+                if isinstance(s, dict) and s.get("id"):
+                    s = dict(s)
+                    s["_account_dir"] = str(sp_path.parent)
+                    spaces[s["id"]] = s
+        for meta_path in sorted(session_meta_files(root)):
+            meta = load_json(meta_path)
+            if not isinstance(meta, dict) or "sessionId" not in meta or meta["sessionId"] in seen_ids:
+                continue
+            seen_ids.add(meta["sessionId"])
             folder = meta_path.with_suffix("")
             sessions.append({
                 "meta": meta,
                 "meta_path": meta_path,
-                "folder": folder if folder.is_dir() else None,
+                "folder": folder if Path(lp(folder)).is_dir() else None,
                 "space_id": meta.get("spaceId"),
             })
     return spaces, sessions
+
+
+def diagnose(cands: list[Path], bases: list[Path]) -> None:
+    """Print where Claude data was looked for and the newest sessions found anywhere."""
+    print("Claude Desktop data folders checked:")
+    for c in cands:
+        state = "has Cowork sessions" if c in bases else ("exists" if c.is_dir() else "missing")
+        print(f"  [{state}] {c}")
+    roots = list(dict.fromkeys([*bases, *[c for c in cands if c.is_dir()]]))
+    rows = []
+    for base in roots:
+        for sub in (SESSIONS_DIR, "claude-code-sessions"):
+            if (base / sub).is_dir():
+                for mp in session_meta_files(base / sub):
+                    m = load_json(mp, {}) or {}
+                    ts = m.get("lastActivityAt") or m.get("createdAt") or mp.stat().st_mtime * 1000
+                    kind = "cowork" if sub == SESSIONS_DIR else "code-tab"
+                    rows.append((ts, kind, m.get("title") or "(untitled)", mp))
+    rows.sort(reverse=True)
+    counts = {k: sum(1 for r in rows if r[1] == k) for k in ("cowork", "code-tab")}
+    print(f"\nSessions found: {counts['cowork']} Cowork, {counts['code-tab']} Code tab.")
+    print("Newest 15 (Code tab sessions are not exported by this script):")
+    for ts, kind, title, mp in rows[:15]:
+        print(f"  {fmt_ms(ts)}  {kind:8}  {title[:60]}\n      {mp}")
+    cc = Path.home() / ".claude" / "projects"
+    if cc.is_dir():
+        newest = max((p.stat().st_mtime for p in cc.glob("*/*.jsonl")), default=None)
+        print(f"\nClaude Code transcripts folder: {cc}"
+              + (f" (newest {dt.datetime.fromtimestamp(newest):%Y-%m-%d %H:%M})" if newest else " (empty)"))
+    if not rows:
+        print("\nNo session files found. Cowork has not saved any sessions on this machine, or it keeps them elsewhere.")
 
 
 def resolve_space(spaces: dict, query: str) -> dict | None:
@@ -497,6 +546,8 @@ def main():
                     help=f"folder that contains '{SESSIONS_DIR}' (auto-detected)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--list", action="store_true", help="list spaces/projects and sessions")
+    g.add_argument("--diagnose", action="store_true",
+                   help="show where Claude data was looked for and the newest sessions found anywhere")
     g.add_argument("--space", help="space name, space id, or project uuid")
     g.add_argument("--unassigned", action="store_true", help="sessions with no space")
     g.add_argument("--all", action="store_true", help="every session")
@@ -517,22 +568,31 @@ def main():
         a.no_thinking = False
         a.max_tool_chars = 0
 
+    if a.base is not None:
+        bases, tried = [a.base], [a.base]
+    else:
+        bases, tried = find_bases()
+    if a.diagnose:
+        diagnose(tried, bases)
+        return
     if a.base is None:
-        a.base, tried = find_base()
-        if a.base is None:
+        if not bases:
             msg = [f"Could not find Claude Cowork data ('{SESSIONS_DIR}' folder). Looked in:"]
             msg += [f"  {c}" for c in tried]
             if os.name == "nt":
                 msg += ["", "Find it with this PowerShell command, then rerun with --base \"<that folder>\":",
                         "  Get-ChildItem $env:APPDATA,$env:LOCALAPPDATA -Directory -Recurse -Depth 7 "
                         f"-Filter {SESSIONS_DIR} -ErrorAction SilentlyContinue | % Parent | % FullName"]
-            msg += ["", "If Cowork was never used on this machine, there is nothing to export."]
+            msg += ["", "Run with --diagnose for a full report.",
+                    "If Cowork was never used on this machine, there is nothing to export."]
             sys.exit("\n".join(msg))
 
-    spaces, sessions = discover(a.base)
+    spaces, sessions = discover(bases)
 
     if a.list or not (a.space or a.unassigned or a.all):
-        print(f"Base: {a.base}\n")
+        for b in bases:
+            print(f"Base: {b}")
+        print()
         counts: dict[str | None, int] = {}
         for s in sessions:
             counts[s["space_id"]] = counts.get(s["space_id"], 0) + 1
